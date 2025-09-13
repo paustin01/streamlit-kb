@@ -45,7 +45,7 @@ import PyPDF2
 
 # LangChain components for AI and document processing
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.embeddings import BedrockEmbeddings
+from langchain_aws import BedrockEmbeddings  # Updated import to fix deprecation warning
 from langchain_community.vectorstores import Chroma
 from langchain_aws import ChatBedrockConverse
 from langchain.chains import RetrievalQA
@@ -58,10 +58,17 @@ from langchain.chains import RetrievalQA
 # Directory where uploaded documents are stored
 DATA_DIR = "data"
 
-# Create a temporary directory for ChromaDB that gets cleaned up automatically
-# This avoids permission issues and keeps the workspace clean
-TEMP_DIR = tempfile.mkdtemp(prefix="knowledgebase_chromadb_")
-CHROMA_DIR = os.path.join(TEMP_DIR, "chroma_db")
+# Initialize persistent directory for ChromaDB in session state
+# This prevents creating new temp directories on every hot reload
+@st.cache_resource
+def get_chroma_directory():
+    """Get or create a persistent ChromaDB directory that survives hot reloads"""
+    temp_dir = tempfile.mkdtemp(prefix="knowledgebase_chromadb_")
+    chroma_dir = os.path.join(temp_dir, "chroma_db")
+    return temp_dir, chroma_dir
+
+# Get the directories (cached, so won't recreate on hot reload)
+TEMP_DIR, CHROMA_DIR = get_chroma_directory()
 
 # Register cleanup function to remove temp directory when app exits
 # def cleanup_temp_dir():
@@ -164,18 +171,6 @@ def convert_pdf_to_text(uploaded_file, filename):
         return None, 0
 
 # --- DATABASE MANAGEMENT FUNCTIONS ---
-def create_new_chroma_dir():
-    """
-    Create a new ChromaDB directory in the temp space
-    
-    Returns:
-        str: Path to the new ChromaDB directory
-    """
-    # Create a unique subdirectory for this ChromaDB instance
-    timestamp = int(time.time())
-    new_chroma_dir = os.path.join(TEMP_DIR, f"chroma_db_{timestamp}")
-    os.makedirs(new_chroma_dir, exist_ok=True)
-    return new_chroma_dir
 
 def safe_remove_directory(directory):
     """
@@ -248,22 +243,22 @@ def reindex_knowledgebase():
     try:
         print(f"📁 Found {len(processed_files)} file(s) in data directory:")
         
-        # Step 5: Create a new ChromaDB directory in temp space
-        new_chroma_dir = create_new_chroma_dir()
-        print(f"✅ Created new vectorstore directory: {new_chroma_dir}")
+        # Step 5: Use the persistent ChromaDB directory
+        os.makedirs(CHROMA_DIR, exist_ok=True)
+        print(f"✅ Using persistent vectorstore directory: {CHROMA_DIR}")
 
         # Step 6: Create new vectorstore with embeddings
-        print("📁 Creating new vectorstore in temporary directory")
+        print("📁 Creating/updating vectorstore in persistent directory")
         # This is where the magic happens - documents are converted to vectors
         st.session_state.vectorstore = Chroma.from_documents(
             docs,  # The document chunks
             embedding_model,  # The embedding model (converts text to vectors)
-            persist_directory=new_chroma_dir  # Where to save the vector database (temp dir)
+            persist_directory=CHROMA_DIR  # Where to save the vector database (persistent dir)
         )
-        print(f"✅ Created new vectorstore in {new_chroma_dir}")
+        print(f"✅ Created/updated vectorstore in {CHROMA_DIR}")
 
-        # Step 7: Update global variable to point to new location
-        globals()['CHROMA_DIR'] = new_chroma_dir
+        # Step 7: Clear the cache to ensure fresh loading next time
+        load_existing_vectorstore.clear()
         
         # Step 8: Show success messages
         st.success(f"✅ Processed {len(processed_files)} files: {', '.join(processed_files)}")
@@ -302,6 +297,33 @@ if 'current_page' not in st.session_state:
 # Initialize vectorstore loading state
 if 'vectorstore_loaded' not in st.session_state:
     st.session_state.vectorstore_loaded = False
+
+# Try to load existing vectorstore on startup (only if it exists and isn't loaded)
+@st.cache_resource
+def load_existing_vectorstore():
+    """Load existing vectorstore if it exists, returns None if not found"""
+    try:
+        if os.path.exists(CHROMA_DIR) and os.listdir(CHROMA_DIR):
+            # Check if there are any documents in the data directory
+            data_files = [f for f in os.listdir(DATA_DIR) if f.endswith((".txt", ".md"))]
+            if data_files:
+                vectorstore = Chroma(
+                    persist_directory=CHROMA_DIR,
+                    embedding_function=embedding_model
+                )
+                # Test if vectorstore is functional
+                test_results = vectorstore.similarity_search("test", k=1)
+                return vectorstore
+    except Exception as e:
+        print(f"Could not load existing vectorstore: {e}")
+    return None
+
+# Load existing vectorstore if available
+if 'vectorstore' not in st.session_state:
+    existing_vs = load_existing_vectorstore()
+    if existing_vs:
+        st.session_state.vectorstore = existing_vs
+        st.session_state.vectorstore_loaded = True
 
 st.sidebar.title("🧭 Navigation")
 
