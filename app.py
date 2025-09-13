@@ -40,7 +40,7 @@ import atexit
 import streamlit as st
 
 # Environment and PDF processing
-from dotenv import load_dotenv
+# from dotenv import load_dotenv
 import PyPDF2
 
 # LangChain components for AI and document processing
@@ -52,7 +52,7 @@ from langchain.chains import RetrievalQA
 
 # --- ENVIRONMENT SETUP ---
 # Load environment variables from .env file (AWS credentials, etc.)
-load_dotenv()
+# load_dotenv()
 
 # --- CONFIGURATION CONSTANTS ---
 # Directory where uploaded documents are stored
@@ -253,7 +253,7 @@ def reindex_knowledgebase():
         print(f"✅ Created new vectorstore directory: {new_chroma_dir}")
 
         # Step 6: Create new vectorstore with embeddings
-        print(f"📁 Creating new vectorstore in temporary directory")
+        print("📁 Creating new vectorstore in temporary directory")
         # This is where the magic happens - documents are converted to vectors
         st.session_state.vectorstore = Chroma.from_documents(
             docs,  # The document chunks
@@ -268,7 +268,7 @@ def reindex_knowledgebase():
         # Step 8: Show success messages
         st.success(f"✅ Processed {len(processed_files)} files: {', '.join(processed_files)}")
         st.success(f"✅ Created {len(docs)} document chunks")
-        st.success(f"✅ Database saved to temporary directory")
+        st.success("✅ Database saved to temporary directory")
         
         # Step 9: Test the vectorstore to make sure it works
         try:
@@ -291,8 +291,8 @@ def reindex_knowledgebase():
 
 # --- STREAMLIT APPLICATION SETUP ---
 # Configure the main page
-st.set_page_config(page_title="🧠 GenAI Bedrock Knowledgebase")
-st.title("🧠 GenAI Bedrock Knowledgebase")
+st.set_page_config(page_title="☢️ GenAI Bedrock Knowledgebase")
+st.title("☢️ GenAI Bedrock Knowledgebase")
 
 # --- NAVIGATION SIDEBAR ---
 # Initialize session state for page navigation (remembers which page user is on)
@@ -306,8 +306,8 @@ if 'vectorstore_loaded' not in st.session_state:
 st.sidebar.title("🧭 Navigation")
 
 # Create navigation buttons for different pages
-if st.sidebar.button("💬 Ask Questions", use_container_width=True):
-    st.session_state.current_page = "Ask Questions"
+if st.sidebar.button("💬 Ask Doc", use_container_width=True):
+    st.session_state.current_page = "Ask Doc"
 
 if st.sidebar.button("📤 Upload Files / Re-Index", use_container_width=True):
     st.session_state.current_page = "Upload Files"
@@ -472,8 +472,8 @@ elif page == "Delete Files":
             st.session_state.vectorstore_loaded = False
 
 # --- PAGE 3: ASK QUESTIONS ---
-elif page == "Ask Questions":
-    st.header("💬 Ask Questions")
+elif page == "Ask Doc":
+    st.header("💬 Ask Doc")
 
     # Check if vectorstore is loaded and functional
     if 'vectorstore' not in st.session_state or not st.session_state.vectorstore_loaded:
@@ -513,7 +513,23 @@ elif page == "Ask Questions":
 
                     # Build prompt
                     prompt = f"""
-You are an AI assistant helping answer questions based on the provided context.
+You are now assuming the persona of Dr. Emmett “Doc” Brown from the Back to the Future trilogy. 
+Your role is to:
+- Speak and think like Doc Brown: excitable, fast-paced, brilliant, eccentric, and prone to exclamations like “Great Scott!”
+- Stay consistent with Doc’s knowledge, personality, and worldview.
+- Use precise technical jargon (flux capacitors, gigawatts, timelines) but explain in Doc’s quirky, animated teaching style.
+
+Capabilities:
+1. **Canonical QA**: When asked about Back to the Future I, II, or III, retrieve facts from the provided corpus of scripts and summarize faithfully in your own words. Use short quotes only when necessary.
+2. **Speculation Beyond Canon**: If asked about “Back to the Future 4” or events after Part III, clearly label your response as speculation, theory, or invention. Maintain Doc’s voice while extrapolating logically from canon.
+3. **Roleplay**: Stay in character when responding. If the user engages you in dialogue, reply as if you are Doc Brown himself, with full personality.
+4. **Boundaries**: Do not reproduce large chunks of script text verbatim. Use retrieval to summarize, paraphrase, or quote briefly.
+
+Style Guidelines:
+- Always energetic and dramatic in tone.
+- Use analogies, diagrams-in-words, and “mad scientist” style explanations.
+- Maintain moral responsibility consistent with Doc Brown’s character (cautious about time travel’s dangers, ethical about changing history).
+- Respond to user's questions conversationally, typically in a single paragraph.
 
 Context:
 {context}
@@ -534,14 +550,14 @@ Context:
                     answer = llm.invoke(messages)
 
                     # Display answer
-                    st.markdown("### 💬 Answer")
+                    st.markdown("### 🥼 Doc says...")
                     st.write(answer.content)
 
                     # Display sources
-                    st.markdown("### 📄 Retrieved Context")
-                    for i, doc in enumerate(docs):
-                        st.markdown(f"**Source {i+1}:**")
-                        st.write(doc.page_content[:500] + "...")
+                    # st.markdown("### 📄 Retrieved Context")
+                    # for i, doc in enumerate(docs):
+                    #     st.markdown(f"**Source {i+1}:**")
+                    #     st.write(doc.page_content[:500] + "...")
         except Exception as e:
             st.error(f"Error during question answering: {e}")
             st.info("Please re-index your knowledgebase.")
