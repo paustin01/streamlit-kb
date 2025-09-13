@@ -60,7 +60,8 @@ DATA_DIR = "data"
 
 # Create a temporary directory for ChromaDB that gets cleaned up automatically
 # This avoids permission issues and keeps the workspace clean
-TEMP_DIR = tempfile.mkdtemp(prefix="knowledgebase_chromadb_")
+# TEMP_DIR = tempfile.mkdtemp(prefix="knowledgebase_chromadb_")
+TEMP_DIR = "./tmpdir/chroma_db"
 CHROMA_DIR = os.path.join(TEMP_DIR, "chroma_db")
 
 # Register cleanup function to remove temp directory when app exits
@@ -173,7 +174,8 @@ def create_new_chroma_dir():
     """
     # Create a unique subdirectory for this ChromaDB instance
     timestamp = int(time.time())
-    new_chroma_dir = os.path.join(TEMP_DIR, f"chroma_db_{timestamp}")
+    # new_chroma_dir = os.path.join(TEMP_DIR, f"chroma_db_{timestamp}")
+    new_chroma_dir = os.path.join(TEMP_DIR, "chroma_db")
     os.makedirs(new_chroma_dir, exist_ok=True)
     return new_chroma_dir
 
@@ -291,8 +293,8 @@ def reindex_knowledgebase():
 
 # --- STREAMLIT APPLICATION SETUP ---
 # Configure the main page
-st.set_page_config(page_title="☢️ GenAI Bedrock Knowledgebase")
-st.title("☢️ GenAI Bedrock Knowledgebase")
+st.set_page_config(page_title="☢️ Gigawatt bot")
+st.title("☢️ Gigawatt bot")
 
 # --- NAVIGATION SIDEBAR ---
 # Initialize session state for page navigation (remembers which page user is on)
