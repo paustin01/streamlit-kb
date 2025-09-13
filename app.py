@@ -466,8 +466,11 @@ def process_file_chunk(args):
             text = f.read()
 
         if text.strip():  # Only process non-empty files
-            # Split text into chunks using the text splitter
-            splits = text_splitter.create_documents([text])
+            # Split text into chunks using the text splitter with metadata
+            splits = text_splitter.create_documents(
+                [text], 
+                metadatas=[{"source": filename}]
+            )
             return (filename, splits)
         else:
             return (filename, None)
@@ -1128,6 +1131,25 @@ Context:
 
                         # Display the response
                         st.write(response_content)
+                        
+                        # Display sources in a collapsible expander
+                        if docs:
+                            with st.expander(f"📚 Sources ({len(docs)} chunks retrieved)", expanded=False):
+                                for i, doc in enumerate(docs, 1):
+                                    st.markdown(f"**Chunk {i}:**")
+                                    
+                                    # Display the chunk content in a code block for better readability
+                                    chunk_content = doc.page_content.strip()
+                                    if len(chunk_content) > 500:
+                                        # Show first 500 chars with option to expand
+                                        st.markdown(f"```\n{chunk_content[:500]}...\n```")
+                                        if st.button(f"Show full chunk {i}", key=f"expand_chunk_{i}"):
+                                            st.markdown(f"```\n{chunk_content}\n```")
+                                    else:
+                                        st.markdown(f"```\n{chunk_content}\n```")
+                                    
+                                    if i < len(docs):  # Add separator between chunks
+                                        st.markdown("---")
 
                         # Save assistant message to database and session state
                         save_chat_message(st.session_state.current_chat_session, "assistant", response_content)
