@@ -37,7 +37,13 @@ import tempfile
 import atexit
 import sqlite3
 import uuid
+import hashlib
+import json
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+from typing import List
+import math
 
 # Streamlit for web interface
 import streamlit as st
@@ -64,10 +70,13 @@ DATA_DIR = "data"
 # SQLite database for chat history
 CHAT_DB_PATH = "chat_history.db"
 
+# Persistent ChromaDB directory to survive hot reloads
+CHROMA_DIR = "chroma_db"
+
 # Create a temporary directory for ChromaDB that gets cleaned up automatically
 # This avoids permission issues and keeps the workspace clean
-TEMP_DIR = tempfile.mkdtemp(prefix="knowledgebase_chromadb_")
-CHROMA_DIR = os.path.join(TEMP_DIR, "chroma_db")
+# TEMP_DIR = tempfile.mkdtemp(prefix="knowledgebase_chromadb_")
+# CHROMA_DIR = os.path.join(TEMP_DIR, "chroma_db")
 
 # Register cleanup function to remove temp directory when app exits
 # def cleanup_temp_dir():
@@ -83,7 +92,7 @@ CHROMA_DIR = os.path.join(TEMP_DIR, "chroma_db")
 
 # AWS Bedrock model IDs - these are the AI models we'll use
 AWS_BEDROCK_EMBEDDING_MODEL_ID = "amazon.titan-embed-text-v1"  # For converting text to vectors
-AWS_BEDROCK_LLM_MODEL_ID = "us.amazon.nova-micro-v1:0"          # For answering questions
+AWS_BEDROCK_LLM_MODEL_ID = "us.amazon.nova-premier-v1:0"          # For answering questions
 AWS_REGION = "us-west-2"  # AWS region where Bedrock is available
 
 # --- DATABASE FUNCTIONS ---
@@ -225,6 +234,119 @@ def delete_chat_session(session_id):
     conn.commit()
     conn.close()
 
+# --- VECTORSTORE PERSISTENCE FUNCTIONS ---
+def get_data_hash():
+    """
+    Generate a hash of all data files to detect changes
+
+    Returns:
+        str: MD5 hash of all file contents and timestamps
+    """
+    hash_md5 = hashlib.md5()
+
+    if not os.path.exists(DATA_DIR):
+        return hash_md5.hexdigest()
+
+    files = [f for f in os.listdir(DATA_DIR) if f.endswith((".txt", ".md"))]
+    files.sort()  # Ensure consistent ordering
+
+    for filename in files:
+        file_path = os.path.join(DATA_DIR, filename)
+        try:
+            # Hash filename and modification time
+            hash_md5.update(filename.encode('utf-8'))
+            hash_md5.update(str(os.path.getmtime(file_path)).encode('utf-8'))
+
+            # Hash file contents
+            with open(file_path, 'rb') as f:
+                for chunk in iter(lambda: f.read(4096), b""):
+                    hash_md5.update(chunk)
+        except Exception:
+            continue
+
+    return hash_md5.hexdigest()
+
+def save_vectorstore_metadata(data_hash, chroma_dir):
+    """
+    Save metadata about the vectorstore
+
+    Args:
+        data_hash (str): Hash of the data used to create vectorstore
+        chroma_dir (str): Path to the ChromaDB directory
+    """
+    metadata = {
+        'data_hash': data_hash,
+        'chroma_dir': chroma_dir,
+        'created_at': datetime.now().isoformat()
+    }
+
+    with open('vectorstore_metadata.json', 'w') as f:
+        json.dump(metadata, f)
+
+def load_vectorstore_metadata():
+    """
+    Load vectorstore metadata
+
+    Returns:
+        dict: Metadata dictionary or None if not found
+    """
+    try:
+        with open('vectorstore_metadata.json', 'r') as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return None
+    except Exception:
+        return None
+
+def vectorstore_needs_update():
+    """
+    Check if vectorstore needs to be updated based on data changes
+
+    Returns:
+        bool: True if update needed, False otherwise
+    """
+    current_hash = get_data_hash()
+    metadata = load_vectorstore_metadata()
+
+    if not metadata:
+        return True
+
+    # Check if ChromaDB directory still exists
+    if not os.path.exists(metadata.get('chroma_dir', '')):
+        return True
+
+    return current_hash != metadata.get('data_hash')
+
+def load_existing_vectorstore():
+    """
+    Load existing vectorstore if it exists and is valid
+
+    Returns:
+        bool: True if successfully loaded, False otherwise
+    """
+    metadata = load_vectorstore_metadata()
+
+    if not metadata:
+        return False
+
+    chroma_dir = metadata.get('chroma_dir')
+    if not chroma_dir or not os.path.exists(chroma_dir):
+        return False
+
+    try:
+        st.session_state.vectorstore = Chroma(
+            persist_directory=chroma_dir,
+            embedding_function=embedding_model
+        )
+
+        # Test the vectorstore
+        test_results = st.session_state.vectorstore.similarity_search("test", k=1)
+        return True
+
+    except Exception as e:
+        print(f"Error loading existing vectorstore: {e}")
+        return False
+
 # --- AI COMPONENTS INITIALIZATION ---
 # Initialize the embedding model (converts text to numerical vectors for similarity search)
 embedding_model = BedrockEmbeddings(
@@ -309,129 +431,327 @@ def convert_pdf_to_text(uploaded_file, filename):
         return None, 0
 
 # --- DATABASE MANAGEMENT FUNCTIONS ---
-def create_new_chroma_dir():
+def process_file_chunk(args):
     """
-    Create a new ChromaDB directory in the temp space
-    
+    Process a single file for the vectorstore (used for concurrent processing)
+
+    Args:
+        args: Tuple of (filename, file_path, text_splitter)
+
     Returns:
-        str: Path to the new ChromaDB directory
+        tuple: (filename, document_chunks) or (filename, None) if error
     """
-    # Create a unique subdirectory for this ChromaDB instance
-    timestamp = int(time.time())
-    new_chroma_dir = os.path.join(TEMP_DIR, f"chroma_db_{timestamp}")
-    os.makedirs(new_chroma_dir, exist_ok=True)
-    return new_chroma_dir
+    filename, file_path, text_splitter = args
+
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            text = f.read()
+
+        if text.strip():  # Only process non-empty files
+            # Split text into chunks using the text splitter
+            splits = text_splitter.create_documents([text])
+            return (filename, splits)
+        else:
+            return (filename, None)
+
+    except Exception as e:
+        print(f"Error processing file {filename}: {e}")
+        return (filename, None)
+
+def create_embeddings_batch(docs_batch: List, embedding_model, batch_id: int, total_batches: int):
+    """
+    Create embeddings for a batch of documents
+
+    Args:
+        docs_batch: List of documents to embed
+        embedding_model: The embedding model to use
+        batch_id: Current batch number
+        total_batches: Total number of batches
+
+    Returns:
+        tuple: (batch_id, embeddings_list, texts_list) or (batch_id, None, None) on error
+    """
+    try:
+        texts = [doc.page_content for doc in docs_batch]
+
+        # Create embeddings for the batch
+        embeddings = embedding_model.embed_documents(texts)
+
+        return (batch_id, embeddings, texts)
+
+    except Exception as e:
+        print(f"Error creating embeddings for batch {batch_id}: {e}")
+        return (batch_id, None, None)
+
+def create_vectorstore_with_progress(docs: List, embedding_model, persist_directory: str,
+                                     batch_size: int = 50, progress_callback=None):
+    """
+    Create vectorstore with real progress tracking by processing documents in batches
+
+    Args:
+        docs: List of documents to embed
+        embedding_model: The embedding model
+        persist_directory: Where to save the vectorstore
+        batch_size: Number of documents per batch
+        progress_callback: Function to call for progress updates
+
+    Returns:
+        Chroma vectorstore instance
+    """
+    import time
+    import threading
+
+    total_docs = len(docs)
+    print(f"Processing {total_docs} documents in batches of {batch_size}")
+
+    if progress_callback:
+        progress_callback(0.0, f"Initializing vectorstore...")
+
+    # Create empty vectorstore first
+    vectorstore = Chroma(
+        persist_directory=persist_directory,
+        embedding_function=embedding_model
+    )
+
+    # Process documents in batches to show progress
+    processed_docs = 0
+
+    for i in range(0, total_docs, batch_size):
+        batch_end = min(i + batch_size, total_docs)
+        batch_docs = docs[i:batch_end]
+        batch_size_actual = len(batch_docs)
+
+        if progress_callback:
+            progress = processed_docs / total_docs
+            progress_callback(progress, f"Processing batch {i//batch_size + 1}: docs {i+1}-{batch_end}")
+
+        # Add batch to vectorstore
+        try:
+            vectorstore.add_documents(batch_docs)
+            processed_docs += batch_size_actual
+
+            # Small delay to show progress updates
+            time.sleep(0.1)
+
+        except Exception as e:
+            print(f"Error adding batch {i//batch_size + 1}: {e}")
+            # Continue with next batch
+            continue
+
+    if progress_callback:
+        progress_callback(1.0, f"Completed! Processed {processed_docs} documents")
+
+    print(f"Successfully created vectorstore with {processed_docs} documents")
+    return vectorstore
 
 def safe_remove_directory(directory):
     """
-    Safely remove a directory with proper error handling
-    With temp directories, this should be much simpler and more reliable
-    
+    Safely remove a directory with proper error handling and permission fixes
+
     Args:
         directory (str): Path to directory to remove
-        
+
     Returns:
         bool: True if successful, False otherwise
     """
     if not os.path.exists(directory):
         return True
-    
+
     try:
-        # Since we're using temp directories, removal should be straightforward
+        # Fix permissions recursively before deletion
+        for root, dirs, files in os.walk(directory):
+            # Make directories writable
+            for d in dirs:
+                dir_path = os.path.join(root, d)
+                try:
+                    os.chmod(dir_path, 0o755)
+                except Exception:
+                    pass
+
+            # Make files writable
+            for f in files:
+                file_path = os.path.join(root, f)
+                try:
+                    os.chmod(file_path, 0o644)
+                except Exception:
+                    pass
+
+        # Make root directory writable
+        os.chmod(directory, 0o755)
+
+        # Now remove the directory
         shutil.rmtree(directory, ignore_errors=True)
         return not os.path.exists(directory)
+
     except Exception as e:
         print(f"Error removing directory {directory}: {e}")
-        return False
+        # Try force removal as last resort
+        try:
+            shutil.rmtree(directory, ignore_errors=True)
+            return not os.path.exists(directory)
+        except:
+            return False
 
 # --- CORE KNOWLEDGEBASE FUNCTION ---
 def reindex_knowledgebase():
     """
     Re-index the knowledgebase by processing all documents in the data directory
-    This is the core function that:
-    1. Reads all text files from the data directory
-    2. Splits them into chunks
-    3. Converts chunks to vector embeddings
-    4. Stores embeddings in ChromaDB for similarity search
-    
+    This function now includes:
+    1. Progress tracking with real-time updates
+    2. Concurrent file processing for better performance
+    3. Persistent storage that survives hot reloads
+    4. Smart checking to avoid unnecessary re-indexing
+
     Returns:
         bool: True if successful, False otherwise
     """
-    
+
+    # Step 1: Check if we actually need to reindex
+    if not vectorstore_needs_update():
+        if load_existing_vectorstore():
+            st.info("📚 Vectorstore is up to date, no reindexing needed!")
+            st.session_state.vectorstore_loaded = True
+            return True
+
     # Step 2: Ensure data directory exists
     os.makedirs(DATA_DIR, exist_ok=True)
-    
-    # Step 3: Process all documents in the data directory
-    docs = []  # List to store all document chunks
-    processed_files = []  # List to track which files were processed
-    
-    # Loop through all files in the data directory
-    for filename in os.listdir(DATA_DIR):
-        if filename.endswith(".txt") or filename.endswith(".md"):
-            try:
-                # Read the file content
-                with open(os.path.join(DATA_DIR, filename), "r", encoding="utf-8") as f:
-                    text = f.read()
-                    
-                    if text.strip():  # Only process non-empty files
-                        # Split text into chunks using the text splitter
-                        splits = text_splitter.create_documents([text])
-                        docs.extend(splits)
-                        processed_files.append(filename)
-                    else:
-                        st.warning(f"Skipping empty file: {filename}")
-                        
-            except Exception as e:
-                st.error(f"Error reading file {filename}: {e}")
-                continue
-    
-    # Step 4: Check if we have any documents to process
-    if not docs:
+    os.makedirs(CHROMA_DIR, exist_ok=True)
+
+    # Step 3: Get list of files to process
+    files = [f for f in os.listdir(DATA_DIR) if f.endswith((".txt", ".md"))]
+
+    if not files:
         st.error("No valid documents found to index.")
         return False
-    
+
+    # Step 4: Setup progress tracking
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    total_steps = len(files) + 2  # +2 for vectorstore creation and testing
+    current_step = 0
+
     try:
-        print(f"📁 Found {len(processed_files)} file(s) in data directory:")
-        
-        # Step 5: Create a new ChromaDB directory in temp space
-        new_chroma_dir = create_new_chroma_dir()
-        print(f"✅ Created new vectorstore directory: {new_chroma_dir}")
+        status_text.text("🔍 Processing files...")
 
-        # Step 6: Create new vectorstore with embeddings
-        print("📁 Creating new vectorstore in temporary directory")
-        # This is where the magic happens - documents are converted to vectors
-        st.session_state.vectorstore = Chroma.from_documents(
-            docs,  # The document chunks
-            embedding_model,  # The embedding model (converts text to vectors)
-            persist_directory=new_chroma_dir  # Where to save the vector database (temp dir)
+        # Step 5: Process files concurrently with progress tracking
+        docs = []
+        processed_files = []
+
+        # Prepare arguments for concurrent processing
+        file_args = [
+            (filename, os.path.join(DATA_DIR, filename), text_splitter)
+            for filename in files
+        ]
+
+        # Use ThreadPoolExecutor for concurrent processing
+        with ThreadPoolExecutor(max_workers=min(4, len(files))) as executor:
+            # Submit all file processing tasks
+            future_to_filename = {
+                executor.submit(process_file_chunk, args): args[0]
+                for args in file_args
+            }
+            # Process completed tasks as they finish
+            for future in as_completed(future_to_filename):
+                filename = future_to_filename[future]
+                current_step += 1
+                progress = current_step / total_steps
+                progress_bar.progress(progress)
+
+                try:
+                    result_filename, splits = future.result()
+                    if splits:
+                        docs.extend(splits)
+                        processed_files.append(result_filename)
+                        status_text.text(f"✅ Processed {result_filename} ({len(splits)} chunks)")
+                    else:
+                        status_text.text(f"⚠️ Skipped empty file: {result_filename}")
+
+                except Exception as e:
+                    st.warning(f"Error processing {filename}: {e}")
+
+                time.sleep(0.1)  # Small delay to show progress
+
+        # Step 6: Check if we have any documents to process
+        if not docs:
+            st.error("No valid documents found to index after processing.")
+            return False
+
+        # Step 7: Create vectorstore with batched embeddings and progress tracking
+        current_step += 1
+        progress_bar.progress(current_step / total_steps)
+        status_text.text(f"🔮 Creating embeddings for {len(docs)} document chunks...")
+
+        # Remove old vectorstore if it exists
+        if os.path.exists(CHROMA_DIR):
+            safe_remove_directory(CHROMA_DIR)
+
+        # Create directory with proper permissions
+        os.makedirs(CHROMA_DIR, exist_ok=True)
+        os.chmod(CHROMA_DIR, 0o755)
+
+        # Progress callback for embedding creation
+        embedding_progress_bar = st.progress(0)
+        embedding_status = st.empty()
+
+        def embedding_progress_callback(progress: float, message: str):
+            embedding_progress_bar.progress(progress)
+            embedding_status.text(f"⚡ {message}")
+
+        # Create vectorstore with real progress tracking
+        st.session_state.vectorstore = create_vectorstore_with_progress(
+            docs=docs,
+            embedding_model=embedding_model,
+            persist_directory=CHROMA_DIR,
+            batch_size=50,  # Process 50 documents at a time
+            progress_callback=embedding_progress_callback
         )
-        print(f"✅ Created new vectorstore in {new_chroma_dir}")
 
-        # Step 7: Update global variable to point to new location
-        globals()['CHROMA_DIR'] = new_chroma_dir
-        
-        # Step 8: Show success messages
-        st.success(f"✅ Processed {len(processed_files)} files: {', '.join(processed_files)}")
-        st.success(f"✅ Created {len(docs)} document chunks")
-        st.success("✅ Database saved to temporary directory")
-        
-        # Step 9: Test the vectorstore to make sure it works
+        # Clean up embedding progress indicators
+        embedding_progress_bar.empty()
+        embedding_status.empty()
+
+        # Step 8: Test the vectorstore
+        current_step += 1
+        progress_bar.progress(current_step / total_steps)
+        status_text.text("🔬 Testing vectorstore...")
+
         try:
             test_results = st.session_state.vectorstore.similarity_search("test", k=1)
-            st.success(f"✅ Vectorstore test successful - found {len(test_results)} results")
+            status_text.text("✅ Vectorstore test successful!")
         except Exception as e:
             st.error(f"Vectorstore test failed: {e}")
             return False
 
-        # Step 10: Celebrate success!
-        time.sleep(2)
+        # Step 9: Save metadata for persistence
+        data_hash = get_data_hash()
+        save_vectorstore_metadata(data_hash, CHROMA_DIR)
+
+        # Step 10: Show final success messages
+        progress_bar.progress(1.0)
+        st.success(f"✅ Successfully processed {len(processed_files)} files: {', '.join(processed_files)}")
+        st.success(f"✅ Created {len(docs)} document chunks")
+        st.success(f"✅ Vectorstore saved to {CHROMA_DIR}")
+
+        # Clean up UI elements
+        progress_bar.empty()
+        status_text.empty()
+
+        # Celebrate!
+        time.sleep(1)
         st.balloons()
-        
+
         return True
-        
+
     except Exception as e:
         st.error(f"Error creating vectorstore: {e}")
         st.error("Please check your AWS credentials and Bedrock access.")
+
+        # Clean up UI elements on error
+        if 'progress_bar' in locals():
+            progress_bar.empty()
+        if 'status_text' in locals():
+            status_text.empty()
+
         return False
 
 # --- STREAMLIT APPLICATION SETUP ---
@@ -450,6 +770,11 @@ if 'current_page' not in st.session_state:
 # Initialize vectorstore loading state
 if 'vectorstore_loaded' not in st.session_state:
     st.session_state.vectorstore_loaded = False
+
+# Auto-load existing vectorstore on startup if available
+if not st.session_state.vectorstore_loaded and 'vectorstore' not in st.session_state:
+    if load_existing_vectorstore():
+        st.session_state.vectorstore_loaded = True
 
 # Initialize chat session state
 if 'current_chat_session' not in st.session_state:
