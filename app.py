@@ -49,7 +49,7 @@ import math
 import streamlit as st
 
 # Environment and PDF processing
-# from dotenv import load_dotenv
+from dotenv import load_dotenv
 import PyPDF2
 
 # LangChain components for AI and document processing
@@ -61,7 +61,7 @@ from langchain.chains import RetrievalQA
 
 # --- ENVIRONMENT SETUP ---
 # Load environment variables from .env file (AWS credentials, etc.)
-# load_dotenv()
+load_dotenv()
 
 # --- CONFIGURATION CONSTANTS ---
 # Directory where uploaded documents are stored
@@ -141,7 +141,7 @@ def create_chat_session(title=None):
     """
     session_id = str(uuid.uuid4())
     if not title:
-        title = f"Chat {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+        title = f"New Chat"
 
     conn = sqlite3.connect(CHAT_DB_PATH)
     cursor = conn.cursor()
@@ -153,6 +153,24 @@ def create_chat_session(title=None):
     conn.close()
 
     return session_id
+
+def update_chat_title(session_id, new_title):
+    """
+    Update the title of a chat session
+
+    Args:
+        session_id (str): Session ID
+        new_title (str): New title for the session
+    """
+    conn = sqlite3.connect(CHAT_DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('''
+        UPDATE chat_sessions 
+        SET title = ?, updated_at = CURRENT_TIMESTAMP
+        WHERE session_id = ?
+    ''', (new_title, session_id))
+    conn.commit()
+    conn.close()
 
 def save_chat_message(session_id, message_type, content):
     """
@@ -760,7 +778,13 @@ init_chat_database()
 
 # Configure the main page
 st.set_page_config(page_title="☢️ Gigawatt chatbot")
-st.title("☢️ Gigawatt chatbot")
+
+# Add header image
+try:
+    st.image("header.jpeg", use_container_width=True)
+except:
+    # Fallback if image not found
+    st.title("☢️ Gigawatt chatbot")
 
 # --- NAVIGATION SIDEBAR ---
 # Initialize session state for page navigation (remembers which page user is on)
@@ -810,24 +834,30 @@ if st.sidebar.button("➕ New Chat", use_container_width=True):
 # Load existing sessions
 chat_sessions = get_chat_sessions()
 if chat_sessions:
-    st.sidebar.subheader("Recent Chats")
+    st.sidebar.subheader("💬 Recent Chats")
     for session_id, title, updated_at in chat_sessions[:10]:  # Show last 10 sessions
-        # Create a unique key for each button
-        button_key = f"load_session_{session_id}"
-        if st.sidebar.button(f"💭 {title[:25]}...", key=button_key, use_container_width=True):
-            st.session_state.current_chat_session = session_id
-            st.session_state.chat_messages = get_chat_messages(session_id)
-            st.session_state.current_page = "Chat"
-            st.rerun()
-
-        # Delete session option
-        delete_key = f"delete_session_{session_id}"
-        if st.sidebar.button("🗑️", key=delete_key):
-            delete_chat_session(session_id)
-            if st.session_state.current_chat_session == session_id:
-                st.session_state.current_chat_session = None
-                st.session_state.chat_messages = []
-            st.rerun()
+        # Create columns for chat and delete button
+        col1, col2 = st.sidebar.columns([4, 1])
+        
+        with col1:
+            # Truncate title if too long
+            display_title = title if len(title) <= 30 else f"{title[:27]}..."
+            button_key = f"load_session_{session_id}"
+            if st.button(f"💭 {display_title}", key=button_key, use_container_width=True):
+                st.session_state.current_chat_session = session_id
+                st.session_state.chat_messages = get_chat_messages(session_id)
+                st.session_state.current_page = "Chat"
+                st.rerun()
+        
+        with col2:
+            # Delete session option
+            delete_key = f"delete_session_{session_id}"
+            if st.button("🗑️", key=delete_key, help="Delete this chat"):
+                delete_chat_session(session_id)
+                if st.session_state.current_chat_session == session_id:
+                    st.session_state.current_chat_session = None
+                    st.session_state.chat_messages = []
+                st.rerun()
 
 # Get the current page from session state
 page = st.session_state.current_page
@@ -1043,6 +1073,15 @@ elif page == "Chat":
                 # Save user message to database and session state
                 save_chat_message(st.session_state.current_chat_session, "user", prompt)
                 st.session_state.chat_messages.append(("user", prompt, datetime.now()))
+                
+                # Update chat title with first user message (if this is the first message)
+                if len(st.session_state.chat_messages) == 1:  # First message
+                    # Create a meaningful title from the first few words
+                    title_words = prompt.split()[:6]  # First 6 words
+                    new_title = " ".join(title_words)
+                    if len(prompt.split()) > 6:
+                        new_title += "..."
+                    update_chat_title(st.session_state.current_chat_session, new_title)
 
                 # Generate AI response
                 with st.chat_message("assistant"):
