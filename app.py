@@ -35,6 +35,9 @@ import stat
 import time
 import tempfile
 import atexit
+import sqlite3
+import uuid
+from datetime import datetime
 
 # Streamlit for web interface
 import streamlit as st
@@ -58,6 +61,9 @@ from langchain.chains import RetrievalQA
 # Directory where uploaded documents are stored
 DATA_DIR = "data"
 
+# SQLite database for chat history
+CHAT_DB_PATH = "chat_history.db"
+
 # Create a temporary directory for ChromaDB that gets cleaned up automatically
 # This avoids permission issues and keeps the workspace clean
 TEMP_DIR = tempfile.mkdtemp(prefix="knowledgebase_chromadb_")
@@ -79,6 +85,145 @@ CHROMA_DIR = os.path.join(TEMP_DIR, "chroma_db")
 AWS_BEDROCK_EMBEDDING_MODEL_ID = "amazon.titan-embed-text-v1"  # For converting text to vectors
 AWS_BEDROCK_LLM_MODEL_ID = "us.amazon.nova-micro-v1:0"          # For answering questions
 AWS_REGION = "us-west-2"  # AWS region where Bedrock is available
+
+# --- DATABASE FUNCTIONS ---
+def init_chat_database():
+    """
+    Initialize the SQLite database for storing chat history
+    Creates tables if they don't exist
+    """
+    conn = sqlite3.connect(CHAT_DB_PATH)
+    cursor = conn.cursor()
+
+    # Create chat_sessions table
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS chat_sessions (
+            session_id TEXT PRIMARY KEY,
+            title TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+
+    # Create chat_messages table
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS chat_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT,
+            message_type TEXT,  -- 'user' or 'assistant'
+            content TEXT,
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (session_id) REFERENCES chat_sessions(session_id)
+        )
+    ''')
+
+    conn.commit()
+    conn.close()
+
+def create_chat_session(title=None):
+    """
+    Create a new chat session
+
+    Args:
+        title (str): Optional title for the session
+
+    Returns:
+        str: Session ID
+    """
+    session_id = str(uuid.uuid4())
+    if not title:
+        title = f"Chat {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+
+    conn = sqlite3.connect(CHAT_DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT INTO chat_sessions (session_id, title)
+        VALUES (?, ?)
+    ''', (session_id, title))
+    conn.commit()
+    conn.close()
+
+    return session_id
+
+def save_chat_message(session_id, message_type, content):
+    """
+    Save a chat message to the database
+
+    Args:
+        session_id (str): Session ID
+        message_type (str): 'user' or 'assistant'
+        content (str): Message content
+    """
+    conn = sqlite3.connect(CHAT_DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT INTO chat_messages (session_id, message_type, content)
+        VALUES (?, ?, ?)
+    ''', (session_id, message_type, content))
+
+    # Update session timestamp
+    cursor.execute('''
+        UPDATE chat_sessions
+        SET updated_at = CURRENT_TIMESTAMP
+        WHERE session_id = ?
+    ''', (session_id,))
+
+    conn.commit()
+    conn.close()
+
+def get_chat_sessions():
+    """
+    Get all chat sessions ordered by most recent
+
+    Returns:
+        list: List of session tuples (session_id, title, updated_at)
+    """
+    conn = sqlite3.connect(CHAT_DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT session_id, title, updated_at
+        FROM chat_sessions
+        ORDER BY updated_at DESC
+    ''')
+    sessions = cursor.fetchall()
+    conn.close()
+    return sessions
+
+def get_chat_messages(session_id):
+    """
+    Get all messages for a specific chat session
+
+    Args:
+        session_id (str): Session ID
+
+    Returns:
+        list: List of message tuples (message_type, content, timestamp)
+    """
+    conn = sqlite3.connect(CHAT_DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT message_type, content, timestamp
+        FROM chat_messages
+        WHERE session_id = ?
+        ORDER BY timestamp ASC
+    ''', (session_id,))
+    messages = cursor.fetchall()
+    conn.close()
+    return messages
+
+def delete_chat_session(session_id):
+    """
+    Delete a chat session and all its messages
+
+    Args:
+        session_id (str): Session ID to delete
+    """
+    conn = sqlite3.connect(CHAT_DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('DELETE FROM chat_messages WHERE session_id = ?', (session_id,))
+    cursor.execute('DELETE FROM chat_sessions WHERE session_id = ?', (session_id,))
+    conn.commit()
+    conn.close()
 
 # --- AI COMPONENTS INITIALIZATION ---
 # Initialize the embedding model (converts text to numerical vectors for similarity search)
@@ -290,6 +435,9 @@ def reindex_knowledgebase():
         return False
 
 # --- STREAMLIT APPLICATION SETUP ---
+# Initialize database
+init_chat_database()
+
 # Configure the main page
 st.set_page_config(page_title="☢️ GenAI Bedrock Knowledgebase")
 st.title("☢️ GenAI Bedrock Knowledgebase")
@@ -297,17 +445,24 @@ st.title("☢️ GenAI Bedrock Knowledgebase")
 # --- NAVIGATION SIDEBAR ---
 # Initialize session state for page navigation (remembers which page user is on)
 if 'current_page' not in st.session_state:
-    st.session_state.current_page = "Upload Files"
+    st.session_state.current_page = "Chat"
 
 # Initialize vectorstore loading state
 if 'vectorstore_loaded' not in st.session_state:
     st.session_state.vectorstore_loaded = False
 
+# Initialize chat session state
+if 'current_chat_session' not in st.session_state:
+    st.session_state.current_chat_session = None
+
+if 'chat_messages' not in st.session_state:
+    st.session_state.chat_messages = []
+
 st.sidebar.title("🧭 Navigation")
 
 # Create navigation buttons for different pages
-if st.sidebar.button("💬 Ask Doc", use_container_width=True):
-    st.session_state.current_page = "Ask Doc"
+if st.sidebar.button("💬 Chat", use_container_width=True):
+    st.session_state.current_page = "Chat"
 
 if st.sidebar.button("📤 Upload Files / Re-Index", use_container_width=True):
     st.session_state.current_page = "Upload Files"
@@ -315,8 +470,46 @@ if st.sidebar.button("📤 Upload Files / Re-Index", use_container_width=True):
 if st.sidebar.button("🗑️ Delete Files", use_container_width=True):
     st.session_state.current_page = "Delete Files"
 
+# --- CHAT SESSION MANAGEMENT ---
+st.sidebar.markdown("---")
+st.sidebar.title("💬 Chat Sessions")
+
+# New chat button
+if st.sidebar.button("➕ New Chat", use_container_width=True):
+    new_session_id = create_chat_session()
+    st.session_state.current_chat_session = new_session_id
+    st.session_state.chat_messages = []
+    st.session_state.current_page = "Chat"
+    st.rerun()
+
+# Load existing sessions
+chat_sessions = get_chat_sessions()
+if chat_sessions:
+    st.sidebar.subheader("Recent Chats")
+    for session_id, title, updated_at in chat_sessions[:10]:  # Show last 10 sessions
+        # Create a unique key for each button
+        button_key = f"load_session_{session_id}"
+        if st.sidebar.button(f"💭 {title[:25]}...", key=button_key, use_container_width=True):
+            st.session_state.current_chat_session = session_id
+            st.session_state.chat_messages = get_chat_messages(session_id)
+            st.session_state.current_page = "Chat"
+            st.rerun()
+
+        # Delete session option
+        delete_key = f"delete_session_{session_id}"
+        if st.sidebar.button("🗑️", key=delete_key):
+            delete_chat_session(session_id)
+            if st.session_state.current_chat_session == session_id:
+                st.session_state.current_chat_session = None
+                st.session_state.chat_messages = []
+            st.rerun()
+
 # Get the current page from session state
 page = st.session_state.current_page
+
+# Load chat messages for current session if we have one
+if st.session_state.current_chat_session and not st.session_state.chat_messages:
+    st.session_state.chat_messages = get_chat_messages(st.session_state.current_chat_session)
 
 # --- PAGE 1: UPLOAD FILES ---
 if page == "Upload Files":
@@ -471,9 +664,9 @@ elif page == "Delete Files":
             st.warning("No documents found to index or indexing failed.")
             st.session_state.vectorstore_loaded = False
 
-# --- PAGE 3: ASK QUESTIONS ---
-elif page == "Ask Doc":
-    st.header("💬 Ask Doc")
+# --- PAGE 3: CHAT INTERFACE ---
+elif page == "Chat":
+    st.header("💬 Chat with Doc Brown")
 
     # Check if vectorstore is loaded and functional
     if 'vectorstore' not in st.session_state or not st.session_state.vectorstore_loaded:
@@ -490,75 +683,89 @@ elif page == "Ask Doc":
             st.info("📁 No files found. Go to 'Upload Files' to add documents first.")
 
     else:
+        # Ensure we have a current chat session
+        if not st.session_state.current_chat_session:
+            st.session_state.current_chat_session = create_chat_session()
+            st.session_state.chat_messages = []
+
         try:
-            # Step 1: Set up retriever (top 3 chunks)
+            # Set up retriever and LLM
             retriever = st.session_state.vectorstore.as_retriever(search_kwargs={"k": 3})
 
-            # Step 2: Initialize the Bedrock LLM (completion-style)
             from langchain_community.llms import Bedrock
-
             llm = ChatBedrockConverse(
                 region_name=AWS_REGION,
                 model_id=AWS_BEDROCK_LLM_MODEL_ID
             )
 
-            # Step 3: Text input for question
-            question = st.text_input("Enter your question:")
+            # Display chat messages
+            chat_container = st.container()
+            with chat_container:
+                for message_type, content, _ in st.session_state.chat_messages:
+                    if message_type == "user":
+                        with st.chat_message("user"):
+                            st.write(content)
+                    else:
+                        with st.chat_message("assistant"):
+                            st.write(content)
 
-            if st.button("Generate Answer") and question:
-                with st.spinner("Retrieving and generating answer..."):
-                    # Retrieve relevant documents
-                    docs = retriever.get_relevant_documents(question)
-                    context = "\n\n".join([doc.page_content for doc in docs])
+            # Chat input
+            if prompt := st.chat_input("Ask Doc Brown anything..."):
+                # Add user message to chat
+                with st.chat_message("user"):
+                    st.write(prompt)
 
-                    # Build prompt
-                    prompt = f"""
-You are now assuming the persona of Dr. Emmett “Doc” Brown from the Back to the Future trilogy. 
+                # Save user message to database and session state
+                save_chat_message(st.session_state.current_chat_session, "user", prompt)
+                st.session_state.chat_messages.append(("user", prompt, datetime.now()))
+
+                # Generate AI response
+                with st.chat_message("assistant"):
+                    with st.spinner("Doc is thinking..."):
+                        # Retrieve relevant documents
+                        docs = retriever.get_relevant_documents(prompt)
+                        context = "\n\n".join([doc.page_content for doc in docs])
+
+                        # Build prompt
+                        system_prompt = f"""
+You are now assuming the persona of Dr. Emmett "Doc" Brown from the Back to the Future trilogy.
 Your role is to:
-- Speak and think like Doc Brown: excitable, fast-paced, brilliant, eccentric, and prone to exclamations like “Great Scott!”
-- Stay consistent with Doc’s knowledge, personality, and worldview.
-- Use precise technical jargon (flux capacitors, gigawatts, timelines) but explain in Doc’s quirky, animated teaching style.
+- Speak and think like Doc Brown: excitable, fast-paced, brilliant, eccentric, and prone to exclamations like "Great Scott!"
+- Stay consistent with Doc's knowledge, personality, and worldview.
+- Use precise technical jargon (flux capacitors, gigawatts, timelines) but explain in Doc's quirky, animated teaching style.
 
 Capabilities:
 1. **Canonical QA**: When asked about Back to the Future I, II, or III, retrieve facts from the provided corpus of scripts and summarize faithfully in your own words. Use short quotes only when necessary.
-2. **Speculation Beyond Canon**: If asked about “Back to the Future 4” or events after Part III, clearly label your response as speculation, theory, or invention. Maintain Doc’s voice while extrapolating logically from canon.
+2. **Speculation Beyond Canon**: If asked about "Back to the Future 4" or events after Part III, clearly label your response as speculation, theory, or invention. Maintain Doc's voice while extrapolating logically from canon.
 3. **Roleplay**: Stay in character when responding. If the user engages you in dialogue, reply as if you are Doc Brown himself, with full personality.
 4. **Boundaries**: Do not reproduce large chunks of script text verbatim. Use retrieval to summarize, paraphrase, or quote briefly.
 
 Style Guidelines:
 - Always energetic and dramatic in tone.
-- Use analogies, diagrams-in-words, and “mad scientist” style explanations.
-- Maintain moral responsibility consistent with Doc Brown’s character (cautious about time travel’s dangers, ethical about changing history).
+- Use analogies, diagrams-in-words, and "mad scientist" style explanations.
+- Maintain moral responsibility consistent with Doc Brown's character (cautious about time travel's dangers, ethical about changing history).
 - Respond to user's questions conversationally, typically in a single paragraph.
 
 Context:
 {context}
 """
 
-                    messages = [
-                        (
-                            "system",
-                            prompt,
-                        ),
-                        (
-                            "human", 
-                            question,
-                        ),
-                    ]
+                        messages = [
+                            ("system", system_prompt),
+                            ("human", prompt),
+                        ]
 
-                    # Generate completion
-                    answer = llm.invoke(messages)
+                        # Generate completion
+                        answer = llm.invoke(messages)
+                        response_content = answer.content
 
-                    # Display answer
-                    st.markdown("### 🥼 Doc says...")
-                    st.write(answer.content)
+                        # Display the response
+                        st.write(response_content)
 
-                    # Display sources
-                    # st.markdown("### 📄 Retrieved Context")
-                    # for i, doc in enumerate(docs):
-                    #     st.markdown(f"**Source {i+1}:**")
-                    #     st.write(doc.page_content[:500] + "...")
+                        # Save assistant message to database and session state
+                        save_chat_message(st.session_state.current_chat_session, "assistant", response_content)
+                        st.session_state.chat_messages.append(("assistant", response_content, datetime.now()))
         except Exception as e:
-            st.error(f"Error during question answering: {e}")
+            st.error(f"Error during chat: {e}")
             st.info("Please re-index your knowledgebase.")
             st.session_state.vectorstore_loaded = False
